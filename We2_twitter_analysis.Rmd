@@ -1,0 +1,731 @@
+---
+title: "#We2: Re-defining European identity"
+subtitle: "A data science perspective on online activism using Twitter data"
+author: "Konstantin Gavras and Lisa Hehnke"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+*Acknowledgements:* Parts of the code for this analysis are based on the #MeTwo project we conducted together with [Paul Meiners](https://www.uni-muenster.de/IfPol/personen/meiners.html), [Sandra Meneses](https://github.com/symeneses), and [Juan Orduz](https://juanitorduz.github.io/). The final results of our project can soon be found [here](https://metwo.correlaid.org/).
+
+## Introduction
+
+The European project is at stake with today's election of the European Parliament. In nearly all European countries, populist and anti-European parties are on the rise. They try to gain votes by providing simple answers to complicated questions, most prominently, that the European Union should not bother with politics within the European nations, emphasizing the supremacy of national sovereignty and exploiting the feelings of national identity. Yet, after more than 60 years of European integration, is it actually that easy to pinpoint the nation one belongs to, feels emotionally attached to, and identifies with? 
+
+In order to tackle this challenge, social activist [Ali Can](https://ali-can.de/), the founder of the #MeTwo movement, launched a new hashtag on May 20, 2019: #We2. Using this hashtag, Ali draws attention to the new realities in an integrated Europe. People nowadays not only have one identity; instead, identity is multi-faceted, hierarchical and sometimes even contradicting. But no matter the nation(s) people feel attached to, European unification taught us that identities should always be inclusive. 
+
+To empirically test the implications and outcomes of this new movement, we decided to scrape all N = 793 tweets on #We2 from May 20 to May 26, 2019 (last retrieval: 1:30 p.m.), and examine the content, scope, and temporal dynamics of this ongoing social media event. As such, we aim to answer the following questions:
+
+1. How did the #We2 movement emerge and develop until the European election day on May 26, 2019?
+2. Which users have been involved in the online movement so far? Who are the most retweeted and favorited users? Do they tweet from personal accounts or verified ones that are of public interest? How inclusive is the movement overall?
+3. How does the retweet network currently look like? Are there any key players that could potentially influence and shape the debate as the online movement continues? 
+4. Which content was shared and discussed during these first days? Which opinions and emotions are expressed in the tweets? Is there a connection to other prominent hashtags? Did the hashtag manage to spread to other European countries?
+
+
+```{r setup, include = FALSE}
+MAIN_DIR <- rprojroot::find_rstudio_root_file()
+
+knitr::opts_chunk$set(echo = TRUE, error = TRUE, warning = FALSE, message = FALSE, fig.width = 9, fig.height = 6, (root.dir = paste0(MAIN_DIR,"/Blogpost_We2")))
+
+if (!require("pacman")) install.packages("pacman")
+library(pacman)
+
+p_load(ggraph, glue, igraph, magrittr, readr, reshape2, rtweet, stopwords, tidygraph, tidytext, tidyverse, tm, widyr, wordcloud, wordcloud2)
+```
+
+```{r, echo = FALSE, include = FALSE}
+##--------------------------------------------------------------------##
+##                      #We2: TIME PREPOCESSING                       ##
+##--------------------------------------------------------------------##
+
+#' Adds a column `created_at_round_mins` which rounds to the minute 
+#' the `created_at` column. It also completes the new column to have 
+#' all minutes (filled with NA if there is no tweet).
+#'
+#' @param data_df Input data frame. 
+#' @return Data frame with net time column rounded to the minute. 
+add_complete_minute_time <- function(data_df) {
+  
+  assertthat::assert_that("created_at" %in% colnames(data_df))
+  
+  data_df %<>% mutate(created_at_round_mins = created_at %>% round(units = 'mins') %>% as.POSIXct())
+  
+  # Complete the data with all dates in between. 
+  minute_seq_df <- tibble(created_at_round_mins = seq(from = min(data_df$created_at_round_mins), 
+                                                      to = max(data_df$created_at_round_mins), 
+                                                      by = 'mins'))
+  
+  data_df %<>% right_join(y = minute_seq_df, by = "created_at_round_mins")
+  
+  data_df %<>% mutate(date = as.Date(created_at_round_mins))
+  
+  return(data_df)
+}
+```
+
+```{r, echo = FALSE, include = FALSE}
+##--------------------------------------------------------------------##
+##                      #We2: TEXT PREPROCESSING                      ##
+##--------------------------------------------------------------------##
+
+#' Given a text vector, it removes urls and bad chatacters.
+#'
+#' @param text Character vector. 
+#' @return Text corpus object. 
+preprocess_text_to_corpus <- function(text) {
+  text_corpus <- VCorpus(VectorSource(text))
+  text_corpus <- tm_map(text_corpus, removeNumbers)
+  text_corpus <- tm_map(text_corpus, tolower)
+
+  # Remove URL.
+  removeURL <- function(x) gsub("(f|ht)tp(s?)://\\S+", "", x, perl=T)
+  text_corpus <- tm_map(text_corpus, removeURL)
+  
+  # Remove bad characters.
+  toSpace <- function (x , pattern) gsub(pattern, " ", x)
+  text_corpus <- tm_map(text_corpus, toSpace, "/")
+  text_corpus <- tm_map(text_corpus, toSpace, "\\|")
+  text_corpus <- tm_map(text_corpus, toSpace, "&amp")
+  
+  text_corpus <- tm_map(text_corpus, stripWhitespace)
+  text_corpus <- tm_map(text_corpus, PlainTextDocument)
+  
+  return(text_corpus)
+}
+
+
+#' Converts a text corpus object to a 
+#' 1-column data frame containing the text. 
+#'
+#' @param text_corpus Text corpus object. 
+#' @return 1-column data frame. 
+corpus_to_df <- function(text_corpus) {
+  
+  clean_text <- sapply(X = text_corpus, FUN = function(x) x$content)
+  
+  df <- tibble(clean_text = clean_text)
+  
+  return(df)
+}
+
+
+#' Extends data frame with a `text` column with a 
+#' `clean_text` column. 
+#'
+#' @param df Data frame with a column `text`. 
+#' @return Data frame with ncol(df) + 1 columns. 
+preprocess_text <- function(df) {
+  
+  assertthat::assert_that("text" %in% colnames(df))
+  
+  text_corpus <- preprocess_text_to_corpus(text = df$text)
+  
+  text_df <- corpus_to_df(text_corpus = text_corpus)
+  
+  ## Remove hashtags (new column).
+  text_df %<>% mutate(clean_text_no_hashtags = str_replace_all(string = clean_text, 
+                                                               pattern = "#\\S+", 
+                                                               replacement = " "))
+  
+  output_df <- bind_cols(df, text_df)
+  
+  return(output_df)
+}
+```
+
+```{r, echo = FALSE, include = FALSE}
+##-------------------------------------------------------------##
+##                      #We2: TEXT MINING                      ##
+##-------------------------------------------------------------##
+
+#' Generate word count for a given text column.
+#'
+#' @param data_df Input data frame.
+#' @param col_name Name of the column to count words. 
+#' @return Data frame wit two colums `word` and `n`, the 
+#' former representing the word appearance in the text 
+#' column `col_name`.
+get_word_count_df <- function(data_df, col_name) {
+  
+  require(rlang)
+  
+  assertthat::assert_that(col_name %in% colnames(data_df))
+  
+  # Get stopwords ("en" and "de").
+  stopwords_df <- tibble(word = c(stopwords::stopwords(language = "de"), stopwords::stopwords(language = "en")))
+  
+  # Get words per tweet (removing stopwords).
+  words_df <- data_df %>% 
+               unnest_tokens(output = word, input = !!rlang::sym(col_name)) %>% 
+               anti_join(y = stopwords_df, by = "word")
+  
+  # Get absolute word count.
+  word_count <- words_df %>% count(word) %>% arrange(- n)
+  
+  return(word_count)
+}
+```
+
+```{r, echo = FALSE, include = FALSE}
+##-------------------------------------------------------------##
+##               #We2: THEME FOR VISUALIZATIONS                ##
+##-------------------------------------------------------------##
+
+viz_theme <- theme(
+  strip.background = element_rect(colour = "grey20", fill = "#92a1a9"),
+  axis.line = element_line(colour = "grey20"),
+  panel.grid.major = element_blank(),
+  panel.grid.minor = element_blank(),
+  panel.border = element_blank(),
+  panel.background = element_blank(),
+  strip.text = element_text(size = rel(1), face = "bold"),
+  plot.caption = element_text(colour = "#4e5975"),
+  legend.key = element_rect(colour = "transparent", fill = "white")
+  )
+```
+
+```{r, echo = FALSE, include = FALSE}
+##-------------------------------------------------------------------##
+##                       #We2: READ FROM RDS                         ##
+##-------------------------------------------------------------------##
+
+#' Load data from original .rds file.
+#'
+#' @return Raw data  frame.
+load_data_from_rds_we2 <- function() {
+  
+  raw_data <- readRDS(file = "we2_tweets.rds")
+  
+  raw_data %<>% select(
+    # Columns to select. 
+    user_id, 
+    status_id, 
+    created_at, 
+    text, 
+    source, 
+    is_quote, 
+    is_retweet, 
+    hashtags, 
+    screen_name, 
+    retweet_screen_name, 
+    location,
+    followers_count,
+    friends_count,
+    verified,
+    lang, 
+    retweet_count, 
+    urls_expanded_url, 
+    mentions_user_id, 
+    mentions_screen_name, 
+    retweet_favorite_count, 
+    favorite_count
+    )
+  
+  # Unlist hashtags columns.
+  # For multiple hashtags they are separated by a comma. 
+  raw_data %<>% 
+    mutate(hashtags_unlist  = map_chr(.x = hashtags, .f = ~ if_else(condition = (length(.x) == 1),
+                                                                    true = .x[[1]], 
+                                                                    false = str_c(.x, collapse = ","))))
+  
+  return(raw_data)
+}
+```
+
+```{r, echo = FALSE, include = FALSE}
+##-------------------------------------------------------------##
+##                       #We2: TEXT FILTER                     ##
+##-------------------------------------------------------------##
+
+get_num_tweets_per_hour <- function(df) {
+  
+  count_df <- df %>% 
+    select(created_at, clean_text_no_hashtags) %>% 
+    mutate(created_at =  created_at %>% round(units = "hour") %>% as.POSIXct()) %>% 
+    count(created_at) 
+  
+  return(count_df)
+}
+
+"%notin%" <- Negate("%in%")
+```
+
+```{r, include = FALSE}
+# Load data and filter redundant observations
+raw_data <- load_data_from_rds_we2()
+
+min_date_time <- "2019-05-20 15:27:13"	
+
+data_df <- preprocess_text(df = raw_data) %>% 
+  filter(created_at > min_date_time) 
+```
+
+## Twitter activities
+
+### Tweets & retweets stats
+
+In an initial step, we simply plot the number of tweets and retweets associated with the #We2 Hashtag. As one can immediately see, this hashtag did not trend particular strong. In total we have less than 1000 tweets in total. When seperating the tweets in original tweets and retweets, we see a ratio of 1:3, which is actually not particular high. Thus, we are examining a hashtag, which did not spread like its pendants #Metoo and #MeTwo being extremely widespread and even changing public discourse and politics on gender equality, sexual harassment, national identity and discrimination. Although trying to spark a discussion on multiple and particular european identities, the #We2 hashtag was apparently not successful. In the following analyses we also try to answer the question, why this movement did not work out although other and quite comparable movement were extremely successful and sparked discussions on social and political problems.
+  
+```{r, fig.align = 'center', echo = FALSE}
+# Plot distribution
+data_df %>% 
+  mutate(is_retweet = if_else(condition = is_retweet, true = "Retweets", false = "Tweets")) %>%
+  ggplot(mapping = aes(x = is_retweet, fill = is_retweet)) +
+  scale_fill_manual(" ", 
+                    breaks = c("Retweets", "Tweets"),
+                    values = c("#1dcaff", "#0084b4")) +
+  viz_theme + ylab("") + xlab("") +
+  geom_bar(alpha = 0.8, width = 0.5) +
+  ggtitle(label = 'Number of tweets and retweets', subtitle = " ")
+```
+
+### Timeline
+
+While the first plot provides information about the total volume of tweets on #We2, the second plot shows the number of tweets and retweets over time. Online movements usually follow a certain chronological order, starting with a triggering event. These events were easy to identify for similar hashtags such as #MeToo with the accusations of sexual misconduct against Harvey Weinstein or #MeTwo with the scandal of Mesut Özil openly supporting the Turkish president Recep Tayyip Erdoğan. When triggering events are salient for a large group of people and can be channeled through an easy-to-understand hashtag, a social media movement is likely to stage. Contrary to this, there was no particular event which might have triggered a high-profile discussion about #We2. Although being launched in the final week of the European elections, elections as such are often too abstract and formalized to spark outrage or particular social media attention. This is exactly what we find with the #We2 tweets. The peak is on May 21 when the hashtag first trended and after this initial peak we can see a steady decline. Thus, without a formative event happening outside the social media sphere and being extremely salient for a large group of people, social media phenomena seem to have a difficult time emerging successfully.
+
+
+```{r, fig.align = "center", echo = FALSE}
+## Credits: Twitter colours by https://www.designpieces.com/2012/12/twitter-colour-palette/.
+data_df %>%
+  mutate(created_at_round_mins = created_at %>% round(units = "hour") %>% as.POSIXct()) %>% 
+  mutate(is_retweet = if_else(condition = is_retweet, true = "Retweets", false = "Tweets")) %>% 
+  count(created_at_round_mins, is_retweet) %>%
+  ggplot() + 
+  geom_line(mapping = aes(x = created_at_round_mins, y = n, colour = is_retweet)) +
+  scale_colour_manual(" ", 
+                      breaks = c("Retweets", "Tweets"),
+                      values = c("#1dcaff", "#0084b4")) +
+  viz_theme + xlab("") + ylab("") +
+  ggtitle("Number of tweets and retweets over time", subtitle = " ")
+```
+
+
+### Most active users (number of tweets, retweets, and favorites) 
+
+After these aggregated insights into the emergence and development of #We2, we now turn to more fine-grained analyses. Here, we first examine the accounts which used the hashtag the most in their tweets and retweets. As can be seen in the following plot, among the most active users are Ali Can (alicanglobal), the founder of both #MeTwo and #We2, Malcolm Ohanwe (MalcolmMusic), a journalist who strongly influenced the #MeTwo debate when sharing his own experiences with racism, and several politicians from the Social Democratic Party of Germany (hereafter: SPD). Interestingly, there are hardly any non-famous individuals or traditional media accounts among the most active users, indicating that #We2 remained in a very particular subgroup of the Twitter community. Notable exceptions to this are individual accounts such as StopNS2, Der_Dude80 or straeubchen and projects like ColorfulGermany or Amnesty International Göttingen (amnestygoe).
+
+
+```{r, fig.align = "center", echo = FALSE}
+# Total number of tweets by user
+users_tweets <- data_df %>%
+  group_by(screen_name, is_retweet) %>%  
+  summarise(number_tweets = n()) %>%
+  arrange(desc(number_tweets))
+
+# Plot top 10 users in terms of number of tweets
+users_tweets %>%
+  group_by(is_retweet) %>%
+  top_n(10, number_tweets) %>%
+  ungroup() %>%
+  mutate(screen_name = reorder(screen_name, number_tweets)) %>%
+  ggplot(aes(screen_name, number_tweets, label = number_tweets)) +
+  geom_bar(aes(fill = is_retweet), stat = "identity", width = 0.5, alpha = 0.8) +
+  scale_fill_manual(name = "", 
+                    labels = c("Tweet", "Retweet"), 
+                    values = c("FALSE"= "#0084b4", "TRUE" = "#1dcaff")) +
+  xlab("") + ylab("") +
+  ggtitle(label = "Top 10 most active accounts (total number of tweets)", 
+          subtitle = " ") +
+  coord_flip() + viz_theme 
+```
+
+Favorites are one of the most important currencies on Twitter, enabling us to examine which accounts were most prominent in a social media movement. The ten most favorited accounts in #We2 were mostly politicians from the SPD:
+* Katarina Barley: Lead candidate for the 2019 European elections (SPD)
+* Heiko Maas: German Minister of Foreign Affairs (SPD)
+* Luisa Neubauer: Climate activist who co-organized Fridays for Future in Germany
+* Sawsan Chebli: State Secretary for Federal Affairs in the state government of Berlin (SPD)
+* Martin Schulz: German politician (SPD)
+* Andrea Nahles: German politician (SPD)
+* Lars Klingbeil: German politician (SPD)
+* Damian Boeselager: Lead candidate for the 2019 European elections (Volt Germany)
+
+In addition, Ali Can and Malcolm Ohanwe can be found among the ten most favorited accounts again. This finding points to another challenge for #We2: There were no prominent Twitter influencers spreading the word. In fact, only Ali Can and Luisa Neubauer can be denoted social media influencers to some degree. But without getting other prominent and thus influential social media users or traditional media accounts on board, online movements seem to lose momentum.
+
+```{r, fig.align = "center", echo = FALSE}
+# Most favorited users
+users_favorites <- data_df %>%
+  filter(is_retweet == FALSE) %>%
+  group_by(screen_name) %>% 
+  summarise(number_favorites = sum(favorite_count)) %>%
+  arrange(desc(number_favorites))
+
+# Plot top 10 users in terms of number of favorites
+users_favorites %>%
+  top_n(10, number_favorites) %>%
+  mutate(screen_name = reorder(screen_name, number_favorites)) %>%
+  ggplot(aes(screen_name, number_favorites, label = number_favorites)) +
+  geom_bar(stat = "identity", width = 0.5, alpha = 0.8, fill = "#1DA1F2") +
+  xlab("") + ylab("") + ggtitle("Top 10 most active twitter accounts (number of favorites)", subtitle = " ") +
+  coord_flip() + viz_theme 
+```
+
+Turning to the number of retweets an account received, a pretty similar picture emerges. We only find one personal, but unusually active, account here: liebmeinland. 
+
+```{r, fig.align = "center", echo = FALSE}
+# Most retweeted users
+users_retweets <- data_df %>%
+  filter(is_retweet == FALSE) %>%
+  group_by(screen_name) %>% 
+  summarise(number_retweets = sum(retweet_count)) %>%
+  arrange(desc(number_retweets))
+
+# Plot top 10 users in terms of number of retweets
+users_retweets %>%
+  top_n(10, number_retweets) %>%
+  mutate(screen_name = reorder(screen_name, number_retweets)) %>%
+  ggplot(aes(screen_name, number_retweets, label = number_retweets)) +
+  geom_bar(stat = "identity", width = 0.5, alpha = 0.8, fill = "#1DA1F2") +
+  xlab("") + ylab("") + ggtitle("Top 10 most active twitter accounts (number of retweets)", subtitle = " ") + ylim(0, 200) +
+  coord_flip() + viz_theme 
+```
+
+Summing up the most active Twitter users on #We2, we find that these accounts are primarily social activists (Ali Can and Luisa Neubauer) or, to a larger extent, politicians (most often from the SPD). Yet, no media accounts or journalists other than Malcolm Ohanwe show up in our analysis.
+
+### Account status
+
+Since our previous results strongly indicate that political elites shaped the debate and neither activists nor journalists played a larger role so far. To check whether the debate indeed was strongly influenced by political officials, we classified all accounts into the following categories:
+* Verified account: Account is of public interest and thus officially verified by Twitter
+* Influencer: Account has more than 500 followers and its number of followers is at least three times higher than the number of followed accounts
+* Verified influencer: Account is both officially verified and an influencer (the most important accounts when trying to spread a social media movement)
+* Personal account: Account that is neither verified nor classified as an influencer
+
+```{r, echo = FALSE, warning = FALSE}
+# Add influencer status
+data_df$influencer <- ifelse(data_df$followers_count >= 500 & data_df$followers_count >= 3 * data_df$friends_count, 'YES', 'NO')
+
+# Classify accounts into differenct user categories based on verification status and influencer status
+data_df$category <- ifelse(data_df$verified == FALSE & data_df$influencer == 'YES', 'influencer',
+		ifelse(data_df$verified == TRUE & data_df$influencer == 'NO', 'verified',
+		ifelse(data_df$verified == TRUE & data_df$influencer == 'YES', 'verified_influencer',
+		ifelse(data_df$verified == FALSE & data_df$influencer == 'NO', 'personal', 'uncategorized'
+		))))
+```
+
+The following plot shows that, unlike what might have been expected given the previous results, the broader scope of the online movement seems to be less elitist and more inclusive with over 500 unique accounts - a rather large number given that there are only approximately 800 tweets containing #We2 overall. This finding shows that most people tweet from personal accounts, followed with a great distance by (verified) influencers and, lastly, verified accounts who do not fall into the influencer category. 
+
+However, when taking a closer look at those accounts, it shows that many politicians simply are not verified by Twitter yet and elucidates that one should never fully rely on coding by third parties when analysing data. Still, while not being personal accounts in a proper sense, unverified politicans most often do not have a larger following on Twitter, which makes them reasonable candidates for being classified as personal accounts. Since these semantics are not of particular interest for our analysis, we rely on the scheme partially provided by Twitter for now.
+
+```{r, fig.align = 'center', echo = FALSE}
+# Plot number of accounts by status category
+data_df %>% 
+  select(screen_name, category) %>%
+  unique() %>%
+  ggplot(mapping = aes(x = category, fill = category)) +
+  scale_fill_manual(" ", values = c("#FF0000", "#0084b4", "#1dcaff", "#8E6580")) +
+  scale_x_discrete(labels = c("Influencer", "Personal account", "Verified account", "Verified influencer")) +
+  viz_theme + ylab("") + xlab("") +
+  geom_bar(alpha = 0.8, width = 0.5) +
+  ggtitle(label = 'Number of accounts by status', subtitle = " ") +
+  theme(legend.position = "none")
+```
+
+The next figure shows the number of tweets and retweets by status category in order to gain a deeper insight into the respective Twitter behavior. It turns out that personal accounts are to a large extent only retweeting existing tweets and do not take part in the debate as actively as the potentially could. In contrast, verified influencers and verified accounts have a fairly balanced ratio between retweets and tweets. The same is also true for influencers, though they appear to tweet more than retweet, resembling the classical behavior assumed by influencers.
+
+```{r, fig.align = 'center', echo = FALSE}
+# Plot number of tweets and retweets by status category
+data_df %>% 
+  ggplot(mapping = aes(x = category, fill = is_retweet)) +
+  scale_fill_manual(" ", values = c("#0084b4", "#1dcaff"), labels = c("Tweets", "Retweets")) +
+  scale_x_discrete(labels = c("Influencer", "Personal account", "Verified account", "Verified influencer")) +
+  viz_theme + ylab("") + xlab("") + ylim(0, 600) +
+  geom_bar(alpha = 0.8, width = 0.5, position = "dodge") +
+  ggtitle(label = 'Number of tweets and retweets by account status', subtitle = " ")
+```
+
+## Retweet network
+
+After analyzing how #We2 spread in our particular Twitter subpopulation, we now turn to the analysis of the retweet network during the debate. At first, we explain our directed retweet network. We define the nodes as follows: The source is the retweeting account and the target is the retweeted account. We define edges as a connection between two nodes if the source retweeted the target at least once. The coloring of the nodes follows the coloring of our categorization, with red nodes indicating influencers, dark blue personal accounts, light blue verified accounts, and purple verified influencers.
+
+```{r, include = FALSE}
+# Build retweet network
+retweets_df <- data_df %>%
+  filter(is_retweet == TRUE) %>% 
+  select(screen_name, retweet_screen_name) %>% 
+  count(screen_name, retweet_screen_name)
+
+retweets_graph <- graph_from_data_frame(retweets_df, directed = TRUE) %>% 
+  as_tbl_graph() 
+
+# Add account status
+V(retweets_graph)$status <- as.character(data_df$category[match(V(retweets_graph)$name, data_df$screen_name)])
+  
+# Add colours based on account status
+colors_list <- list(
+  "influencer" = c("#FF0000"), 
+  "personal" = c("#0084b4"), 
+  "verified" = c("#1dcaff"),
+  "verified_influencer" = c("#8E6580"),
+  "uncategorized" = c("black"))
+
+# Set color
+V(retweets_graph)$color <- map_chr(.x = V(retweets_graph)$status, .f = ~ colors_list[[.x]])
+```
+
+We plot the retweet network with the size of the nodes relative to their respective in-degree centrality (i.e. the number of retweets an account received). Moreover, we labeled only nodes with centrality scores larger or equal to 10 (i.e. only users that were retweeted at least 10 times are labeled). The edge weight is defined as the number of retweets between two nodes. 
+
+The following network graph confirms the findings of our previous analyses. Activists and SPD politicians are the most central nodes in the Twitter retweet network. As expected, the SPD accounts appear to be rather closely connected, with Fridays for Future climate activist Luisa Neubauer and Damian Boeselager - the lead candidate of the Volt party, who recently gained some fame for temporarily getting the [Wahl-O-Mat](https://www.wahl-o-mat.de/europawahl2019/) shut down - being quite distant to the nodes of the SPD politicans.
+
+```{r, fig.align = "center", fig.width = 10, echo = FALSE}
+# Calculate centrality measure and plot retweet network using ggraph
+retweets_graph %>% 
+  mutate(centrality = centrality_degree(mode = "in", weight = n)) %>% 
+  ggraph(layout = "nicely") +
+  geom_edge_link(aes(edge_alpha = 0.1, width = n/10), edge_colour = "#c0deed") +
+  geom_node_point(aes(size = centrality), colour = V(retweets_graph)$color) + 
+  geom_node_label(aes(label = name, filter = centrality >= 10), repel = TRUE, 
+                 color = "black", fontface = "bold", size = 3, 
+                 label.size = NA, fill = "#ffffff66") + 
+  theme_graph() +
+  theme(legend.position = "none") +
+  labs(title = "Retweet network",
+       subtitle = "Node size relative to in-degree centrality score")
+```
+
+```{r, include = FALSE}
+# Build mention network
+## Credits: The following snippet was adapted from https://perrystephenson.me/2018/09/29/the-r-twitter-network/.
+#mentions_df <- data_df %>% 
+#  filter(is_retweet == FALSE) %>%
+#  select(screen_name, text) %>% 
+#  unnest_tokens("words", "text", "tweets") %>% 
+#  filter(str_detect(words, "^@")) %>% 
+#  mutate(screen_name = screen_name,
+#         mention_screen_name = str_remove(words, "@")) %>% 
+#  count(screen_name, mention_screen_name)
+
+#mentions_graph <- graph_from_data_frame(mentions_df, directed = TRUE) %>% 
+#  as_tbl_graph() 
+
+# Add account status
+## Note: tolower() is required as capitalizations in mentions might differ.
+#V(mentions_graph)$name_lcase <- tolower(V(mentions_graph)$name)
+#data_df$screen_name_lcase <- tolower(data_df$screen_name)
+
+#V(mentions_graph)$status <- as.character(data_df$category[match(V(mentions_graph)$name_lcase, data_df$screen_name_lcase)])
+#V(mentions_graph)$status[is.na(V(mentions_graph)$status)] <- "uncategorized"
+
+# Set color
+#V(mentions_graph)$color <- map_chr(.x = V(mentions_graph)$status, .f = ~ colors_list[[.x]])
+```
+
+```{r, fig.align = "center", fig.width = 10, echo = FALSE}
+# Calculate centrality measure and plot retweet network using ggraph
+#mentions_graph %>% 
+#  mutate(centrality = centrality_degree(mode = "in", weight = n)) %>% 
+#  ggraph(layout = "nicely") +
+#  geom_edge_link(aes(edge_alpha = 0.1, width = n/10), edge_colour = "#c0deed") +
+#  geom_node_point(aes(size = centrality), colour = V(mentions_graph)$color) + 
+#  geom_node_label(aes(label = name, filter = centrality >= 2), repel = TRUE, 
+#                 color = "black", fontface = "bold", size = 3, label.size = NA, 
+#                 fill = "#ffffff66") + 
+#  theme_graph() +
+#  theme(legend.position = "none") +
+#  labs(title = "Mention network",
+#       subtitle = "Node size relative to in-degree centrality score")
+```
+
+## Tweet content
+
+After examining the accounts who participated in the #We2 debate, we now turn to the actual content of the tweets. Ali Can's original idea was to spark a discussion about people's multiple European identities and let the Twitter community express their feelings towards and associations with the European Union more generally. In doing so, #We2 should form a counter-movement to the emerging nationalism and growing chauvinism in several European countries.
+
+The next step of our analysis is structured by two main questions: First, what does the Twitter community actually tweet about the European Union and its implication of more and more people having multiple identities. Second, we examine whether the overall debate is more positive or negative. A positive sentiment would indicate that the Twitter community is willing to share their positive associations with the European idea, whereas a negative sentiment might indicate that either the debate has been captured by trolls or actual accounts mourning about the current stage of the European Union.
+
+### Most common words
+
+```{r, eval = FALSE, include = FALSE}
+# Add language filtering
+sort(table(data_df$lang), decreasing = TRUE)
+
+data_df[['language_cld2']] = sapply(data_df$clean_text_no_hashtags, cld2::detect_language)
+data_df[['language_cld3']] = sapply(data_df$clean_text_no_hashtags, function(x) {if (nchar(x) > 0) {cld3::detect_language_mixed(x)[1, 1]} else{"und"}})
+
+data_df[data_df$lang == "und" & data_df$language_cld3 != "und", c("text", "lang", "language_cld2", "language_cld3")]
+
+data_df_lang = data_df[data_df$lang != "und" & !duplicated(data_df$clean_text_no_hashtags), ]
+sort(table(data_df_lang$lang), decreasing = TRUE)
+```
+
+```{r, include = FALSE, message = FALSE}
+# Get absolute word count
+data_df_orig <- filter(data_df, is_retweet == FALSE)
+word_count <- get_word_count_df(data_df = data_df_orig, col_name = "clean_text_no_hashtags")
+```
+
+In a first analysis, we filtered the most common words that were used in the debate. In order to get a clean picture of these words, we removed stop words and user names prior to plotting. The remaining words show that Europe as such, identity, and references to gratefulness are among the most common words in the tweets. Hence, the people using #We2 seem to discuss exactly the issues that Ali Can had in mind when creating the hashtag. Using a word cloud, we corroborate our first intuition by mapping the 100 most common words.
+
+```{r, fig.align = "center", fig.width = 10, echo = FALSE}
+word_count %>% 
+  top_n(15, n) %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(word, n, label = n)) +
+  geom_col(width = 0.5, alpha = 0.8, fill = "#1DA1F2") +
+  xlab("") + ylab("") + ggtitle(label = "Most common words in tweets", subtitle = " ") +
+  ylim(0, 80) + coord_flip() + viz_theme
+```
+
+```{r, fig.align = "center", fig.width = 8, echo = FALSE}
+# Traditional word cloud
+wordcloud_df <- data.frame("word" = word_count$word[1:100], "freq" = word_count$n[1:100])
+wordcloud_df <- wordcloud_df
+wordcloud2(wordcloud_df, color = "#1DA1F2")
+```
+
+### Co-occurring hashtags
+
+Another layer of content in Twitter debates comes with the usage of additional hashtags to highlight specific aspects users want to emphasize. With regard to the #We2 debate, we see that most of the hashtags are expressing a strong dislike against the right-wing political party Alternative for Germany (AfD) and, more generally, against racism and antisemitism. Thus, the co-occurring hashtags align with and supplement our previous content-related findings by rejecting nationalism and favoring diversity.
+
+```{r, fig.align = "center", echo = FALSE}
+# Count co-occurring hashtags
+hashtag_count <- get_word_count_df(data_df = data_df_orig, col_name = "hashtags_unlist")
+
+# Clean hashtags
+hashtag_rm <- c("we2", NA)
+
+# Plot top 10 co-occurring hashtags
+hashtag_count %>%
+  filter(word %notin% hashtag_rm) %>%
+  top_n(10, n) %>%
+  ungroup() %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(word, n)) +
+  geom_col(width = 0.5, alpha = 0.8, fill = "#1DA1F2") +
+  xlab("") + ylab("") + ggtitle("Top 10 co-occurring hashtags", subtitle = " ") +
+  coord_flip() + viz_theme + ylim(0, 40)
+```
+
+### Tweet sentiments
+
+The last layer of our content analysis concerns the sentiments associated with the respective tweets mentioning #We2. Our sentiment analysis is based on a dictionary approach using the [SentiWS](http://wortschatz.uni-leipzig.de/de/download) dictionary by the University of Leipzig. The dictionary classifies which German words have a negative and positive meaning, respectively, and assigns numeric values to them. We then can simply map the words used in the tweets against the words included in the dictionary along with their values.
+
+```{r, include = FALSE}
+# Tidy tweets for further processing
+senti_rm <- c("dass") 
+stop_german <- data.frame(word = stopwords::stopwords("de"), stringsAsFactors = F)
+
+tweets_tidy <- data_df %>%
+  filter(is_retweet == FALSE) %>%
+  unnest_tokens(word, clean_text_no_hashtags) %>%
+  anti_join(stop_german) %>%
+  select(word, created_at) %>%
+  filter(word %notin% senti_rm)
+```
+
+```{r, include = FALSE, message = FALSE}
+# Import and process SentiWS files
+## Credits: The following code was adapted from https://sebastiansauer.github.io/textmining_AfD_01/. 
+neg_df <- read_tsv("SentiWS_v2.0/SentiWS_v2.0_Negative.txt", col_names = FALSE)
+names(neg_df) <- c("word_pos", "value", "inflections")
+neg_df %<>% 
+  mutate(word = str_sub(word_pos, 1, regexpr("\\|", .$word_pos) - 1),
+         POS = str_sub(word_pos, start = regexpr("\\|", .$word_pos) + 1))
+pos_df <- read_tsv("SentiWS_v2.0/SentiWS_v2.0_Positive.txt", col_names = FALSE)
+names(pos_df) <- c("word_pos", "value", "inflections")
+pos_df %<>% 
+  mutate(word = str_sub(word_pos, 1, regexpr("\\|", .$word_pos) - 1),
+         POS = str_sub(word_pos, start = regexpr("\\|", .$word_pos) + 1))
+sentiment_df <- bind_rows("negative" = neg_df, "positive" = pos_df, .id = "sentiment")
+sentiment_df %<>% 
+  select(word, sentiment) %>%
+  mutate(word = tolower(word))
+```
+
+As we can see in our first analysis, the overall sentiment of the #We2 debate is mostly positive with a ratio of 5:1 compared to negative words. This confirms the findings we got when analyzing both the most common words and the co-occurring hashtags.   
+
+```{r, fig.align = "center", echo = FALSE}
+# Calculate and plot total sentiment scores (SentiWS)
+tweets_tidy %>%
+  inner_join(sentiment_df) %>%
+  count(word, sentiment) %>%
+  ggplot(aes(sentiment, n)) +  
+  geom_bar(aes(fill = sentiment), stat = "identity", alpha = 0.8, width = 0.5) +
+  scale_fill_manual(values = c("#b01919", "#19b019")) + 
+  scale_x_discrete(labels = c("Negative", "Positive")) +
+  xlab("") + ylab("") + ggtitle("Total number of positive and negative words in tweets (SentiWS)", subtitle = " ") + ylim(0, 150) +
+  theme(legend.position = "none") + viz_theme 
+```
+
+When examining the sentiment distribution over time, we see that we actually almost always have more positive words than negative ones. We only see a minor negative peak around May 23 to May 24, 2019. Given the extremely low number of words on these two days, however, this peak should not be overstated.
+
+```{r, fig.align = "center", echo = FALSE}
+# Calculate and plot total sentiment scores over time (SentiWS)
+tweets_tidy %>%
+  inner_join(sentiment_df) %>%
+  mutate(created_at_round_mins = created_at %>% round(units = "hour") %>% as.POSIXct()) %>% 
+  count(created_at_round_mins, sentiment) %>%
+  ggplot() +
+  geom_line(mapping = aes(x = created_at_round_mins, y = n, colour = sentiment)) + 
+  scale_colour_manual(" ", 
+                      breaks = c("Negativ", "Positiv"),
+                      values = c("#b01919", "#19b019")) + 
+  xlab("") + ylab("") + ggtitle("Total number of positive and negative words in tweets over time (SentiWS)", subtitle = " ") + 
+  viz_theme
+```
+
+But which words are actually classified as positive and negative words in the #We2 debate? In the following overview we see that peace, freedom and unity are the most frequently used positive words in the debate. This indicates that most users still seem to associate the core values and principles of the European Union with this fundamental political project on the European continent. On the negative side, we see worries and damages. This might refer to nationalist and populist movements, which are campaigning to damage and overthrow the European Union and its institutions. 
+
+```{r, fig.align = "center", echo = FALSE}
+# Calculate and plot most common positive and negative words
+tweets_tidy %>% 
+  inner_join(sentiment_df) %>% 
+  count(word, sentiment, sort = TRUE) %>%
+  ungroup %>% 
+  group_by(sentiment) %>%
+  top_n(10, n) %>%
+  ungroup() %>%
+  mutate(word = reorder(word, n)) %>%
+  ggplot(aes(word, n)) +
+  geom_bar(stat = 'identity', aes(fill = sentiment), width = 0.5, alpha = 0.8) +
+  scale_fill_manual(name = "Sentiment", 
+                    labels = c("Negative", "Positive"), 
+                    values = c("negative"= "#b01919", "positive" = "#19b019")) + 
+  xlab("") + ylab("") + ggtitle("Most common positive and negative words", subtitle = " ") +
+  viz_theme + coord_flip() + ylim(0, 10)
+```
+
+These findings can be visualized in a comparison cloud as well:
+
+```{r, fig.align = "center", echo = FALSE}
+# Comparison cloud of the most common positive and negative words
+tweets_tidy %>% 
+  inner_join(sentiment_df) %>% 
+  count(word, sentiment, sort = TRUE) %>%
+  acast(word ~ sentiment, value.var = "n", fill = 0) %>%
+  comparison.cloud(colors = c("#b01919", "#19b019"),
+                   max.words = 100)
+```
+
+### Tweets in foreign languages
+
+Lastly, we examine whether the debate spread beyond a German-speaking subgroup on Twitter. Using automated language recognition functions, we classified the tweets in different languages. The following plot shows all languages with a minimum share of 0.001% that were present in the tweets. We see that the majority of the debate took place among German-speaking users. However, we also find some tweets in English, French, Dutch, and Russian. Although not being particular popular among foreign Twitter users, it seems that #We2 has somewhat spread to other European countries as well.
+
+```{r, include = FALSE}
+## National colours (credits: https://www.schemecolor.com): Germany = "#000000", France = "#002395", GB = "#D00C27", Italy = "#009246", Russia = "#0039A6", Turkey = "#E30A17"
+data_df_lang = data_df[data_df$lang != "und" & data_df$is_retweet == FALSE, ]
+sort(round(prop.table(table(data_df_lang$lang)) * 100, 1), decreasing = TRUE)
+```
+
+```{r, fig.align = "center", echo = FALSE}
+# Plot share of foreign languages
+data_df_lang %>% 
+  select(lang) %>% 
+  group_by(lang) %>% 
+  summarize(shareTweets = n()/nrow(.)) %>% 
+  filter(shareTweets >= 0.001) %>% 
+  ungroup() %>% 
+  ggplot(aes(x = reorder(lang, -shareTweets), y = shareTweets)) +
+  geom_bar(aes(fill = lang), stat = "identity", width = 0.5, alpha = 0.8) +
+  scale_fill_manual(values = c("#000000", "#D00C27", "#002395", "#AE1C28", "#0039A6")) + 
+  scale_x_discrete(labels = c("German", "English", "French", "Dutch", "Russian")) +
+  labs(title = "Share of tweets by language", subtitle = " ", x = "", y ="", fill = "Language") + ylim(0, 1) +
+  theme(legend.position = "none") + viz_theme 
+```
+
+## Conclusion
+
+Taken together, #We2 is still a very modest debate, but our Twitter analysis already conveys some very interesting results. Our findings show that #We2 is unusually positive in its tenor and, maybe even more surprisingly, strongly influenced by prominent SPD politicians and only a handful of social media activists. Personal accounts as well as the media and individual journalists, who are essential for social media events to become successful, are not part of the debate yet. 
+
+When compared to Ali Can's other hashtag #MeTwo (see the final results of our project soon [here](https://metwo.correlaid.org/)), we can see that #We2 is mainly driven and supported by political elites rather than the general population. Unlike #MeTwo with the debate on Mesut Özil's retirement from the German national football team, there was no triggering event of broader public interest when #We2 emerged. As a result, the media response is largely absent and hence the potential of traditional media channels has not been fully exploited yet. 
+
+To conlude, #We2 did not went as viral as #MeTwo or its predecessor #MeToo did to date. While we believe the hashtag has the potential to spread further, the future of #We2 largely depends on the active involvement of the traditional media. It is possible that the results of the European election will once again draw the attention of Twitter users to the hashtag. We are staying on the case and provide you with the latest results as they come in!
