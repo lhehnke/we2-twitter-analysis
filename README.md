@@ -1,6 +1,6 @@
 # we2-twitter-analysis
 
-Replication data for [Konstantin Gavras](http://konstantin.gavras.de/)' and my [blog post](https://correlaid.org/blog/we2-twitter-analysis/) on analyzing the #We2 movement on Twitter.
+Replication data for [Konstantin Gavras](http://konstantin.gavras.de/)' and my [blog post](https://correlaid.org/blog/we2-twitter-analysis) on analyzing the #We2 movement on Twitter.
 
 The R Markdown document covers text and code to answer the following questions:
 * How did the #We2 movement emerge and develop until the European election day on May 26, 2019?
